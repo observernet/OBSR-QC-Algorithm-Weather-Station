@@ -1,0 +1,1303 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <time.h>
+#include <math.h>
+#include <errno.h>
+
+#include <ft_common.h>
+#include <ora_common.h>
+#include "wds_common.h"
+
+/*************************************************************************************
+ * 내부수학 함수
+ *************************************************************************************/
+
+int    _QC_GetModelFileName(char* file_name, int utc_file_time);
+int    _QC_GetModelMasterLine(char type, char* file_name);
+int    _QC_GetModelValue(char type, char* file_name, int master_line, int count, double* lngs, double* lats, double* values);
+int    _QC_GetModelValueFromCache(char type, char* file_name, double lng, double lat, double* ptr_lng, double* ptr_lat, double* ptr_value, double* avg, double* stdev);
+void   _QC_WriteModelValueToCache(char type, char* file_name, double lng, double lat, int count, double* ptr_lng, double* ptr_lat, double* ptr_value, double avg, double stdev);
+
+int    _QC_SubtimeHour(int a, int b);
+double _QC_Sum(double data[], int count);
+double _QC_Avg(double data[], int count);
+double _QC_Var(double data[], int count);
+double _QC_Stdev(double data[], int count);
+
+double _deg2rad(double deg);
+double _rad2deg(double rad);
+
+/*************************************************************************************
+ * QC
+ *************************************************************************************/
+
+int QualityCheck(char type, double value, double lng, double lat, int kdate, int ktime, long mws_serial, sql_context ctx)
+{
+	struct tm tm;
+	time_t timep;
+	char stime[32];
+	int N;
+	
+	/* Time to UNIX Timestamp */
+	sprintf(stime, "%08d%06d", kdate, ktime);
+	strptime(stime, "%Y%m%d%H%M%S", &tm);
+	timep = mktime(&tm);
+	
+	/* Time Check */
+	switch ( type )
+	{
+		case QC_TYPE_PRE:
+		case QC_TYPE_TMP:
+		case QC_TYPE_REH:
+		case QC_TYPE_PTY:
+		case QC_TYPE_PM25:
+			break;
+		
+		default:
+			return (QC_ERROR_OK);
+	}
+	
+	/* climate test */
+	if ( QC_ClimateCheck(type, value, lng, lat) == -1 )
+		return (QC_ERROR_RANGE);
+	
+	/* single threshold test */
+	if ( QC_SelfLimitCheck(type, value, lng, lat, timep, mws_serial, ctx) == -1 )
+		return (QC_ERROR_SELF_LIMIT);
+	
+	/* check the Weatherstation data */
+	if ( mws_serial != QC_NO_MWS )
+	{
+		/* In case of pressure/temperature */
+		if ( type == QC_TYPE_PRE || type == QC_TYPE_TMP )
+		{
+			/* Bring in the number of nearby observatories */
+			if ( (N = QC_GetSurroundPoint(lng, lat, timep, ctx)) == -1 )
+				return (QC_ERROR_SURROUND);
+			
+			/* When there are more than three stations */
+			if ( N > 3 )
+			{
+				if ( QC_RangeLimitCheck1(type, value, lng, lat, timep, ctx) == -1 )
+					return (QC_ERROR_LIMIT);
+			}
+		}
+		
+		/* In case of precipitation */
+		if ( type == QC_TYPE_PTY )
+		{
+		//	/* Bring in the number of nearby observatories */
+			if ( (N = QC_GetSurroundPoint(lng, lat, timep, ctx)) == -1 )
+				return (QC_ERROR_SURROUND);
+		//	
+			/* When there are more than three stations */
+			if ( N <= 3 )
+			{
+				if ( QC_RainCheck(type, value, lng, lat, timep, ctx) == -1 )
+					return (QC_ERROR_RAIN);
+			}
+		//	/* more than three stations */
+			else
+		//	{
+				if ( QC_RangeLimitCheck2(type, value, lng, lat, timep, ctx) == -1 )
+					return (QC_ERROR_LIMIT);
+			}
+		}
+	}
+	
+	
+	/* threshold test */
+	if ( QC_RangeLimitCheck(type, value, lng, lat, timep, ctx) == -1 )
+		return (QC_ERROR_LIMIT);
+/**********************************************************************************/
+	/* conducting a model test at the Meteorological Administration */
+	if ( type == QC_TYPE_PM25 )
+	{
+		if ( QC_AirKoreaCheck(type, value, lng, lat, timep, ctx) == -1 )
+			return (QC_ERROR_EXT);
+	}
+	else
+	{
+		if ( QC_ModelCheck(type, value, lng, lat, timep) == -1 )
+			return (QC_ERROR_MODEL);
+	}
+/********************************************************** Model QC Out */
+	return (QC_ERROR_OK);
+}
+
+/**
+ * conduct a climate test 
+ */
+int QC_ClimateCheck(char type, double value, double lng, double lat)
+{
+	switch ( type )
+	{
+		case QC_TYPE_PRE:
+		{
+			if ( value > QC_PRE_MAX || value < QC_PRE_MIN )
+			{
+				sprintf(QC_errmsg, "Basic inspection: Pressure Range Error! value[%lf] range[%lf ~ %lf]", value, QC_PRE_MIN, QC_PRE_MAX);
+				Log("QC_ClimateCheck: %s\n", QC_errmsg);
+				return (-1);
+			}
+			break;
+		}
+		case QC_TYPE_TMP:
+		{
+			if ( value > QC_TMP_MAX || value < QC_TMP_MIN )
+			{
+				sprintf(QC_errmsg, "Basic inspection: Temperature Range Error! value[%lf] range[%lf ~ %lf]", value, QC_TMP_MIN, QC_TMP_MAX);
+				Log("QC_ClimateCheck: %s\n", QC_errmsg);
+				return (-1);
+			}
+			break;
+		}
+		case QC_TYPE_REH:
+		{
+			if ( value > QC_REH_MAX || value < QC_REH_MIN )
+			{
+				sprintf(QC_errmsg, "Basic inspection: relative humidity Range Error! value[%lf] range[%lf ~ %lf]", value, QC_REH_MIN, QC_REH_MAX);
+				Log("QC_ClimateCheck: %s\n", QC_errmsg);
+				return (-1);
+			}
+			break;
+		}
+		case QC_TYPE_PM25:
+		{
+			if ( value > QC_PM25_MAX || value < QC_PM25_MIN )
+			{
+				sprintf(QC_errmsg, "Basic inspection: PM2.5 Range Error! value[%lf] range[%lf ~ %lf]", value, QC_PM25_MIN, QC_PM25_MAX);
+				Log("QC_ClimateCheck: %s\n", QC_errmsg);
+				return (-1);
+			}
+			break;
+		}
+	}
+	
+	return (0);
+}
+
+/**
+ * conduct a single threshold test (Using the six-hour mean and standard deviation of the same gastric hardness)
+ */
+int QC_SelfLimitCheck(char type, double value, double lng, double lat, time_t timep, long mws_serial, sql_context ctx)
+{
+	char sql[MAX_BUFFER];
+	double xlng, xlat, ylng, ylat;
+	long min_timep;
+	
+	double *fdata, fv;
+	int fcount;
+	
+	/* Registering Oracle Use */
+	struct sqlca sqlca;
+	
+	/* only check air pressure, temperature, humidity */
+	if ( type != QC_TYPE_PRE && type != QC_TYPE_TMP && type != QC_TYPE_REH ) return (0);
+		
+	
+	/* calculate the threshold range (Because of the float inaccuracy, consider the same lon/lat as +-0.000001.) */
+	xlat = lat - 0.000001; ylat = lat + 0.000001;
+	xlng = lng - 0.000001; ylng = lng + 0.000001;
+	min_timep = (long)timep - (QC_LIMIT_HOUR * 3600);
+	
+	/* Six hours of data within the range are brought according to the classification value */
+	switch ( type )
+	{
+		case QC_TYPE_PRE:
+			sprintf(sql, "SELECT PRE FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", xlng, ylng, xlat, ylat, min_timep, (long)timep);
+			break;
+			
+		case QC_TYPE_TMP:
+			sprintf(sql, "SELECT TMP FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", xlng, ylng, xlat, ylat, min_timep, (long)timep);
+			break;
+		
+		case QC_TYPE_REH:
+			sprintf(sql, "SELECT REH FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", xlng, ylng, xlat, ylat, min_timep, (long)timep);
+			break;
+		
+		case QC_TYPE_PM25:
+			sprintf(sql, "SELECT PM25 FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", xlng, ylng, xlat, ylat, min_timep, (long)timep);
+			break;
+	}
+	
+	/* Execute the query */
+	EXEC SQL PREPARE _SELF_LIMIT_RANGE_S FROM :sql;
+	EXEC SQL DECLARE _SELF_LIMIT_RANGE CURSOR FOR _SELF_LIMIT_RANGE_S;
+	
+	EXEC SQL OPEN _SELF_LIMIT_RANGE;
+	if ( _SQLOK )
+	{
+		fdata = NULL; fcount = 0;
+		while ( 1 )
+		{
+			EXEC SQL FETCH _SELF_LIMIT_RANGE INTO :fv;
+			if ( _SQLNOTFOUND ) break;
+			
+			if ( fv < 0.0001 ) continue;
+ 		
+	 		fdata = realloc(fdata, sizeof(double)*(fcount+1));
+	 		fdata[fcount] = fv;
+	 		fcount++;
+		}
+	}
+	else
+	{
+		sprintf(QC_errmsg, "An error occurred while retrieving the six-hour data");
+ 		Log("QC_SelfLimitCheck: %s sqlcode[%d]\n", QC_errmsg, sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _SELF_LIMIT_RANGE;
+	
+	/* Check data only when it is above a certain level */
+	if ( fcount >= QC_MIN_DATA_COUNT )
+	{
+		/* mean and standard deviation */
+		double avg = _QC_Avg(fdata, fcount);
+		double stdev = _QC_Stdev(fdata, fcount);
+		
+		/* Calculate the limits */
+		if ( value > avg + 3*stdev || value < avg - 3*stdev )
+		{
+			sprintf(QC_errmsg, "Single threshold test: range error! value[%lf] avg[%lf] stdev[%lf] range[%lf ~ %lf]", value, avg, stdev, avg - 3*stdev, avg + 3*stdev);
+			Log("QC_SelfLimitCheck: %s\n", QC_errmsg);
+			free(fdata);
+			return (-1);
+		}
+	}
+	free(fdata);
+
+#if 0
+
+	/* Calculate the threshold range*/
+	min_timep = (long)timep - (3600L);
+	
+	/* An hour's data of the relevant serial shall be brought according to the classification value */
+	switch ( type )
+	{
+		case QC_TYPE_PRE:
+			sprintf(sql, "SELECT PRE FROM OBSERV_MWS WHERE SERIAL_NO = %ld and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", mws_serial, min_timep, (long)timep);
+			break;
+			
+		case QC_TYPE_TMP:
+			sprintf(sql, "SELECT TMP FROM OBSERV_MWS WHERE SERIAL_NO = %ld and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", mws_serial, min_timep, (long)timep);
+			break;
+		
+		case QC_TYPE_REH:
+			sprintf(sql, "SELECT REH FROM OBSERV_MWS WHERE SERIAL_NO = %ld and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", mws_serial, min_timep, (long)timep);
+			break;
+		
+		case QC_TYPE_PM25:
+			sprintf(sql, "SELECT PM25 FROM OBSERV_MWS WHERE SERIAL_NO = %ld and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ", mws_serial, min_timep, (long)timep);
+			break;
+	}
+	
+	/* Execute the query */
+	EXEC SQL PREPARE _SELF_LIMIT_SERIAL_S FROM :sql;
+	EXEC SQL DECLARE _SELF_LIMIT_SERIAL CURSOR FOR _SELF_LIMIT_SERIAL_S;
+	
+	EXEC SQL OPEN _SELF_LIMIT_SERIAL;
+	if ( _SQLOK )
+	{
+		fdata = NULL; fcount = 0;
+		while ( 1 )
+		{
+			EXEC SQL FETCH _SELF_LIMIT_SERIAL INTO :fv;
+			if ( _SQLNOTFOUND ) break;
+			
+			if ( fv < 0.0001 ) continue;
+ 		
+	 		fdata = realloc(fdata, sizeof(double)*(fcount+1));
+	 		fdata[fcount] = fv;
+	 		fcount++;
+		}
+	}
+	else
+	{
+		sprintf(QC_errmsg, "An error occurred while retrieving the 1 hour data");
+ 		Log("QC_SelfLimitCheck: %s sqlcode[%d]\n", QC_errmsg, sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _SELF_LIMIT_SERIAL;
+	
+	/* Check data only when it is above a certain level */
+	if ( fcount >= 5 )
+	{
+		/* mean and standard deviation */
+		double stdev = _QC_Stdev(fdata, fcount);
+		
+		/* If the value of the MWS does not change, machine abnormality!! */
+		if ( stdev < 0.000001 )
+		{
+			sprintf(QC_errmsg, "Single critical value test: 1 hour standard deviation error! value[%lf] stdev[%lf]", value, stdev);
+			Log("QC_SelfLimitCheck: %s\n", QC_errmsg);
+			free(fdata);
+			return (-1);
+		}
+	}
+	free(fdata);
+	
+#endif
+	
+	return (0);
+}
+
+#if 0
+
+/**
+ * Conduct a critical value test (use the six-hour average and standard deviation within the latitude range)
+ */
+int QC_RangeLimitCheck(char type, double value, double lng, double lat, time_t timep, sql_context ctx)
+{
+	char sql[MAX_BUFFER];
+	double xlng, xlat, ylng, ylat;
+	long min_timep;
+	
+	double *fdata, fv;
+	int fcount;
+	
+	/* Registering Oracle Use */
+	struct sqlca sqlca;
+	
+	/* calculate the threshold range */
+	latitude_range(lat, QC_LIMIT_DISTANCE, &xlat, &ylat);
+	longitude_range(lng, lat, QC_LIMIT_DISTANCE, &xlng, &ylng);
+	min_timep = (long)timep - (QC_LIMIT_HOUR * 3600);
+	
+	/* Six hours of data within the range are brought according to the classification value */
+	switch ( type )
+	{
+		case QC_TYPE_PRE:
+			sprintf(sql, "SELECT PRE "
+						 "FROM "
+						 "( "
+						 "  SELECT PRE FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld "
+						 "  UNION ALL "
+						 "  SELECT PRE FROM OBSERV_PHONE WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld "
+						 ") ",
+						 xlng, ylng, xlat, ylat, min_timep, (long)timep,
+						 xlng, ylng, xlat, ylat, min_timep, (long)timep
+			);
+			break;
+			
+		case QC_TYPE_TMP:
+			sprintf(sql, "SELECT TMP FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ",
+						 xlng, ylng, xlat, ylat, min_timep, (long)timep
+			);
+			break;
+		
+		case QC_TYPE_REH:
+			sprintf(sql, "SELECT REH FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ",
+						 xlng, ylng, xlat, ylat, min_timep, (long)timep
+			);
+			break;
+		
+		case QC_TYPE_PM25:
+			sprintf(sql, "SELECT PM25 FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ",
+						 xlng, ylng, xlat, ylat, min_timep, (long)timep
+			);
+			break;
+	}
+	
+	/* Execute the query */
+	EXEC SQL PREPARE _RANGE_LIMIT_S FROM :sql;
+	EXEC SQL DECLARE _RANGE_LIMIT CURSOR FOR _RANGE_LIMIT_S;
+	
+	EXEC SQL OPEN _RANGE_LIMIT;
+	if ( _SQLOK )
+	{
+		fdata = NULL; fcount = 0;
+		while ( 1 )
+		{
+			EXEC SQL FETCH _RANGE_LIMIT INTO :fv;
+			if ( _SQLNOTFOUND ) break;
+			
+			if ( fv < 0.0001 ) continue;
+ 		
+	 		fdata = realloc(fdata, sizeof(double)*(fcount+1));
+	 		fdata[fcount] = fv;
+	 		fcount++;
+		}
+	}
+	else
+	{
+		sprintf(QC_errmsg, "An error occurred while retrieving the 6-hour data");
+ 		Log("QC_RangeLimitCheck: %s sqlcode[%d]\n", QC_errmsg, sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _RANGE_LIMIT;
+	
+	/* Check data only when it is above a certain level */
+	if ( fcount >= QC_MIN_DATA_COUNT )
+	{
+		/* the mean and standard deviation */
+		double avg = _QC_Avg(fdata, fcount);
+		double stdev = _QC_Stdev(fdata, fcount);
+		
+		/* Calculate the limits */
+		if ( value > avg + 3*stdev || value < avg - 3*stdev )
+		{
+			sprintf(QC_errmsg, "Range Critical Inspection: Range Error! value[%lf] avg[%lf] stdev[%lf] range[%lf ~ %lf]", value, avg, stdev, avg - 3*stdev, avg + 3*stdev);
+			Log("QC_RangeLimitCheck: %s\n", QC_errmsg);
+			free(fdata);
+			return (-1);
+		}
+	}
+	
+	free(fdata);
+	return (0);
+}
+#endif
+
+/**
+ * Bringing in the number of nearby stations
+ */
+int QC_GetSurroundPoint(double lng, double lat, time_t timep, sql_context ctx)
+{
+	char sql[MAX_BUFFER];
+	double xlng, xlat, ylng, ylat;
+	long min_timep;
+	
+	int point_count = 0;
+	
+	/* Registering Oracle Use */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+	
+	/* calculate the range */
+	latitude_range(lat, QC_SURROUND_DISTANCE, &xlat, &ylat);
+	longitude_range(lng, lat, QC_SURROUND_DISTANCE, &xlng, &ylng);
+	min_timep = (long)timep - (QC_SURROUND_HOUR * 3600);
+	
+	/* Bring the number of MWSs in range */
+	sprintf(sql, "SELECT count(SERIAL_NO) "
+				 "FROM "
+				 "( "
+				 "	SELECT distinct SERIAL_NO FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld "
+				 ") ",
+				 xlng, ylng, xlat, ylat, min_timep, (long)timep
+	);
+	
+	/* Execute the query */
+	EXEC SQL PREPARE _GET_SURROUND_S FROM :sql;
+	EXEC SQL DECLARE _GET_SURROUND CURSOR FOR _GET_SURROUND_S;
+	
+	EXEC SQL OPEN _GET_SURROUND;
+	if ( _SQLOK )
+	{
+		point_count = 0;
+		while ( 1 )
+		{
+			EXEC SQL FETCH _GET_SURROUND INTO :point_count;
+			break;
+		}
+	}
+	else
+	{
+		sprintf(QC_errmsg, "Error getting peripheral station information");
+ 		Log("QC_GetSurroundPoint: %s sqlcode[%d]\n", QC_errmsg, sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _GET_SURROUND;
+	
+	return (point_count);
+}
+
+int QC_RangeLimitCheck1(char type, double value, double lng, double lat, time_t timep, sql_context ctx)
+{	
+	char sql[MAX_BUFFER];
+	double xlng, xlat, ylng, ylat;
+	long min_timep;
+	
+	int i, j;
+	long serial_no;
+	double fv;
+	
+	struct mws_data *mdata;
+	int mcount;
+	
+	double avg, stdev;
+	double *fdata;
+	int fcount;
+	
+	/* Registering Oracle Use */
+	struct sqlca sqlca;
+	
+	/* only check the air pressure and temperature */
+	if ( type != QC_TYPE_PRE && type != QC_TYPE_TMP ) return (0);
+	
+	/* calculate the threshold range */
+	latitude_range(lat, QC_SURROUND_DISTANCE, &xlat, &ylat);
+	longitude_range(lng, lat, QC_SURROUND_DISTANCE, &xlng, &ylng);
+	min_timep = (long)timep - (QC_SURROUND_HOUR * 3600);
+	
+	/* data within the range according to the classification value */
+	switch ( type )
+	{
+		case QC_TYPE_PRE:
+			sprintf(sql, "SELECT SERIAL_NO, PRE FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ",
+						 xlng, ylng, xlat, ylat, min_timep, (long)timep
+			);
+			break;
+			
+		case QC_TYPE_TMP:
+			sprintf(sql, "SELECT SERIAL_NO, TMP FROM OBSERV_MWS WHERE LONGITUDE between %lf and %lf and LATITUDE between %lf and %lf and ROUND((UPDATE_TIME-TO_DATE('19700101','YYYYMMDD'))*86400-32400) between %ld and %ld ",
+						 xlng, ylng, xlat, ylat, min_timep, (long)timep
+			);
+			break;
+	}
+	
+	/* Execute the query */
+	EXEC SQL PREPARE _RANGE_LIMIT_1_S FROM :sql;
+	EXEC SQL DECLARE _RANGE_LIMIT_1 CURSOR FOR _RANGE_LIMIT_1_S;
+	
+	EXEC SQL OPEN _RANGE_LIMIT_1;
+	if ( _SQLOK )
+	{
+		mdata = NULL; mcount = 0;
+		while ( 1 )
+		{
+			EXEC SQL FETCH _RANGE_LIMIT_1 INTO :serial_no, :fv;
+			if ( _SQLNOTFOUND ) break;
+			
+			if ( fv < 0.0001 ) continue;
+ 		
+ 			/* Find existing groups */
+ 			for ( i = 0 ; i < mcount ; i++ )
+ 			{
+ 				if ( mdata[i].serial_no == serial_no )
+ 					break;
+ 			}
+ 			if ( i == mcount )
+ 			{
+ 				mdata = realloc(mdata, sizeof(struct mws_data)*(mcount+1));
+		 		mdata[mcount].serial_no = serial_no;
+		 		mdata[mcount].fcount = 0;
+		 		mdata[mcount].fdata = NULL;
+		 		mcount++;
+ 			}
+ 		
+	 		mdata[i].fdata = realloc(mdata[i].fdata, sizeof(double)*(mdata[i].fcount+1));
+	 		mdata[i].fdata[mdata[i].fcount] = fv;
+	 		mdata[i].fcount++;
+		}
+	}
+	else
+	{
+		sprintf(QC_errmsg, "An error occurred while retrieving scope data");
+ 		Log("QC_RangeLimitCheck1: %s sqlcode[%d]\n", QC_errmsg, sqlca.sqlcode);
+ 		return (-1);
+	}
+	EXEC SQL CLOSE _RANGE_LIMIT_1;
+	
+	/* Each group shall leave data within the standard deviation */
+	fdata = NULL; fcount = 0;
+	for ( i = 0 ; i < mcount ; i++ )
+	{
+		avg = _QC_Avg(mdata[i].fdata, mdata[i].fcount);
+		stdev = _QC_Stdev(mdata[i].fdata, mdata[i].fcount);
+		
+		for ( j = 0 ; j < mdata[i].fcount ; j++ )
+		{
+			if ( mdata[i].fdata[j] >= avg - stdev && mdata[i].fdata[j] <= avg + stdev )
+			{
+				fdata = realloc(fdata, sizeof(double)*(fcount+1));
+		 		fdata[fcount] = fv;
+		 		fcount++;
+			}
+		}
+	}
+	
+	/* Check data only when it is above a certain level */
+	if ( fcount >= QC_MIN_DATA_COUNT )
+	{
+		/* mean and standard deviation */
+		avg = _QC_Avg(fdata, fcount);
+		stdev = _QC_Stdev(fdata, fcount);
+		
+		/* Calculate the limits */
+		if ( value > avg + 3*stdev || value < avg - 3*stdev )
+		{
+			sprintf(QC_errmsg, "Range Critical Inspection: Range Error! value[%lf] avg[%lf] stdev[%lf] range[%lf ~ %lf]", value, avg, stdev, avg - 3*stdev, avg + 3*stdev);
+			Log("QC_RangeLimitCheck: %s\n", QC_errmsg);
+			free(fdata);
+			return (-1);
+		}
+	}
+	
+	/* Release Memory */
+	for ( i = 0 ; i < mcount ; i++ ) free(mdata[i].fdata);
+	free(mdata);
+	free(fdata);
+	
+	return (0);
+}
+
+int QC_RangeLimitCheck2(char type, double value, double lng, double lat, time_t timep, sql_context ctx)
+{
+	/* Check the precipitation only */
+	if ( type != QC_TYPE_PTY ) return (0);
+		
+	
+	return (0);
+}
+
+int QC_RainCheck(char type, double value, double lng, double lat, time_t timep, sql_context ctx)
+{
+	/* Check the precipitation only */
+	if ( type != QC_TYPE_PTY ) return (0);
+		
+	
+	return (0);
+}
+/**
+ * Inspection is conducted using model data.
+ */
+int QC_ModelCheck(char type, double value, double lng, double lat, time_t timep)
+{
+	int file_time, utc_data_time;
+	char file_name[64];
+	
+	int i, master_line;
+	double minlng, minlat, maxlng, maxlat;
+	double ptr_lng[QC_MODEL_GRID_SIZE];
+	double ptr_lat[QC_MODEL_GRID_SIZE];
+	double ptr_value[(QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE)];
+	double avg, stdev;
+	
+	/* UTC (GMT+9) => 32400sec */
+	timep = timep - 32400;
+	utc_data_time = intDateFrom(timep) * 100 + intTimeFrom(timep) / 10000;
+	
+	/* Inquiry of the last value of the 3-hour or 6-hour forecast data (file generation and reception time takes 3 to 4 hours, so the forecast data is correct.) */
+	/* But if there's more than a 12 hour difference between the file and the date of the data, let's handle it with the file missing. */
+	file_time = _QC_GetModelFileName(file_name, utc_data_time);
+	if ( file_time <= 0 || _QC_SubtimeHour(utc_data_time, file_time) > 12 )
+	{
+		sprintf(QC_errmsg, "Model scan: Model file does not exist. utc_data_time[%d] file_time[%d]", utc_data_time, file_time);
+		Log("QC_ModelCheck: %s\n", QC_errmsg);
+		return (-1);
+	}
+	
+	/* Get the data from the cache. */
+	if ( _QC_GetModelValueFromCache(type, file_name, lng, lat, ptr_lng, ptr_lat, ptr_value, &avg, &stdev) == 0 )
+	{	
+		/* If there's no data in the cache, we'll go through the process below. */
+		
+		/* Get the master line to process. */
+		master_line = _QC_GetModelMasterLine(type, file_name);
+		if ( master_line <= 0 )
+		{
+			sprintf(QC_errmsg, "Model Inspection: The master does not exist in the model file. type[%c] file_name[%s]", type, file_name);
+			Log("QC_ModelCheck: %s\n", QC_errmsg);
+			return (-1);
+		}
+		
+		/* Bring the nearest gastric longitude based on the current gastric longitude. */
+		ptr_lng[QC_MODEL_GRID_COUNT] = lng;
+		ptr_lat[QC_MODEL_GRID_COUNT] = lat;
+		if ( _QC_GetModelValue(type, file_name, master_line, 1, &ptr_lng[QC_MODEL_GRID_COUNT], &ptr_lat[QC_MODEL_GRID_COUNT], ptr_value) == -1 )
+		{
+			sprintf(QC_errmsg, "Model inspection: Error getting the closest latitude to the current reference latitude type[%c] file_name[%s]", type, file_name);
+			Log("QC_ModelCheck: %s\n", QC_errmsg);
+			return (-1);
+		}
+		
+		/* Based on the modified latitude, calculate the latitude as far as the lattice distance. */
+		for ( i = 1 ; i <= QC_MODEL_GRID_COUNT ; i++ )
+		{
+			latitude_range(ptr_lat[QC_MODEL_GRID_COUNT], QC_MODEL_GRID_DISTANCE * i, &minlat, &maxlat);
+			longitude_range(ptr_lng[QC_MODEL_GRID_COUNT], ptr_lat[QC_MODEL_GRID_COUNT], QC_MODEL_GRID_DISTANCE * i, &minlng, &maxlng);
+			
+			ptr_lng[QC_MODEL_GRID_COUNT - i] = minlng;
+			ptr_lng[QC_MODEL_GRID_COUNT + i] = maxlng;
+			ptr_lat[QC_MODEL_GRID_COUNT - i] = minlat;
+			ptr_lat[QC_MODEL_GRID_COUNT + i] = maxlat;
+		}
+		
+		/* Bring the model value. */
+		if ( _QC_GetModelValue(type, file_name, master_line, QC_MODEL_GRID_SIZE, ptr_lng, ptr_lat, ptr_value) == -1 )
+		{
+			sprintf(QC_errmsg, "Model scan: An error occurred while retrieving type[%c] file_name[%s]", type, file_name);
+			Log("QC_ModelCheck: %s\n", QC_errmsg);
+			return (-1);
+		}
+		
+		/* mean and standard deviation. */
+		avg = _QC_Avg(ptr_value, (QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE));
+		stdev = _QC_Stdev(ptr_value, (QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE));
+		
+		/***********************************************/
+		/* In case of Jeju Island, especially 5*5 is brought up. */
+		
+		double ptr_lng_2[QC_MODEL_GRID_SIZE];
+		double ptr_lat_2[QC_MODEL_GRID_SIZE];
+		double ptr_value_2[(QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE)];
+	
+		/* Find the location of the grid point above. */
+		latitude_range(ptr_lat[QC_MODEL_GRID_COUNT], QC_MODEL_GRID_DISTANCE * (QC_MODEL_GRID_SIZE), &minlat, &maxlat);
+		ptr_lng_2[QC_MODEL_GRID_COUNT] = lng;
+		ptr_lat_2[QC_MODEL_GRID_COUNT] = maxlat;
+		
+		/* Based on the modified latitude, calculate the latitude as far as the lattice distance. */
+		for ( i = 1 ; i <= QC_MODEL_GRID_COUNT ; i++ )
+		{
+			latitude_range(ptr_lat_2[QC_MODEL_GRID_COUNT], QC_MODEL_GRID_DISTANCE * i, &minlat, &maxlat);
+			longitude_range(ptr_lng_2[QC_MODEL_GRID_COUNT], ptr_lat_2[QC_MODEL_GRID_COUNT], QC_MODEL_GRID_DISTANCE * i, &minlng, &maxlng);
+			
+			ptr_lng_2[QC_MODEL_GRID_COUNT - i] = minlng;
+			ptr_lng_2[QC_MODEL_GRID_COUNT + i] = maxlng;
+			ptr_lat_2[QC_MODEL_GRID_COUNT - i] = minlat;
+			ptr_lat_2[QC_MODEL_GRID_COUNT + i] = maxlat;
+		}
+		
+		/* Bring the model value. */
+		if ( _QC_GetModelValue(type, file_name, master_line, QC_MODEL_GRID_SIZE, ptr_lng_2, ptr_lat_2, ptr_value_2) == -1 )
+		{
+			sprintf(QC_errmsg, "Model inspection: An error occurred while retrieving type[%c] file_name[%s]", type, file_name);
+			Log("QC_ModelCheck: %s\n", QC_errmsg);
+			return (-1);
+		}
+		
+		double ptr_value_3[(QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE)*2];
+		memcpy(ptr_value_3, ptr_value, sizeof(double) * (QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE));
+		memcpy(&ptr_value_3[(QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE)], ptr_value_2, sizeof(double) * (QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE));
+		
+		/* Recalculate the mean and standard deviation. */
+		avg = _QC_Avg(ptr_value_3, (QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE)*2);
+		stdev = _QC_Stdev(ptr_value_3, (QC_MODEL_GRID_SIZE)*(QC_MODEL_GRID_SIZE)*2);
+		
+		/* In case of Jeju Island, especially 5*5 is brought up */
+		/***********************************************/
+		
+		
+		/* Write it down in the cache */
+		_QC_WriteModelValueToCache(type, file_name, lng, lat, QC_MODEL_GRID_SIZE, ptr_lng, ptr_lat, ptr_value, avg, stdev);
+	}
+	/* Calculate the limits. */
+	if ( value > avg + 3*stdev || value < avg - 3*stdev )
+	{
+		sprintf(QC_errmsg, "Model inspection: threshold range error! value[%lf] avg[%lf] stdev[%lf] range[%lf ~ %lf] model[%s]", value, avg, stdev, avg - 3*stdev, avg + 3*stdev, file_name);
+		Log("QC_ModelCheck: %s\n", QC_errmsg);
+		return (-1);
+	}
+	
+	return (0);
+}
+
+/* Get the last value of the model data */
+int _QC_GetModelFileName(char* file_name, int utc_file_time)
+{
+	DIR* dir_info;
+	struct dirent* dir_entry;
+	
+	char cmpstr[64], tmpbuf[32];
+	int file_date, max_file_date = 0;
+	int hours;
+	
+	sprintf(cmpstr, "g512_v070_ergl_unis_h000.");
+	dir_info = opendir(QC_MODEL_DIR);
+	if ( dir_info != NULL )
+	{
+		while ( (dir_entry = readdir(dir_info)) )
+		{
+			if ( strstr(dir_entry->d_name, ".tmp") ) continue;
+				
+			if ( strncmp(dir_entry->d_name, cmpstr, strlen(cmpstr)) == 0 )
+			{
+				memcpy(tmpbuf, dir_entry->d_name + strlen(cmpstr), 10); tmpbuf[10] = 0;
+				file_date = atoi(tmpbuf);
+				
+				if ( file_date > utc_file_time ) continue;
+				if ( file_date > max_file_date ) max_file_date = file_date;
+			}
+		}
+		closedir(dir_info);
+	}
+	if ( max_file_date == 0 ) return (-1);
+	
+	hours = (utc_file_time % 100) - (max_file_date % 100);
+	if ( hours < 0 ) hours = 24 + hours;
+	
+	/* Determines the file name based on time. */
+	if ( hours <= 1 )					  sprintf(file_name, "g512_v070_ergl_unis_h000.%010d.gb2", max_file_date);
+	else if ( hours >= 2 && hours <= 4 )  sprintf(file_name, "g512_v070_ergl_unis_h003.%010d.gb2", max_file_date);
+	else if ( hours >= 5 && hours <= 7 )  sprintf(file_name, "g512_v070_ergl_unis_h006.%010d.gb2", max_file_date);
+	else if ( hours >= 8 && hours <= 10 ) sprintf(file_name, "g512_v070_ergl_unis_h009.%010d.gb2", max_file_date);
+	else								  sprintf(file_name, "g512_v070_ergl_unis_h012.%010d.gb2", max_file_date);
+	
+	Log("_QC_GetModelFileName: Model File[%s]\n", file_name);
+	return (max_file_date);
+}
+
+/* Get the masterline of the model data */
+int _QC_GetModelMasterLine(char type, char* file_name)
+{
+	FILE* fp;
+	char pipe_name[256], buff[MAX_BUFFER], stype[32], token[32];
+	int master_line = 0;
+	
+	/* It determines the command based on the classification */
+	switch ( type )
+	{
+		case QC_TYPE_PRE: strcpy(stype, "PRES"); break;
+		case QC_TYPE_TMP: strcpy(stype, "TMP"); break;
+		case QC_TYPE_REH: strcpy(stype, "RH"); break;
+	}
+	
+	/* Pipe Open */
+	if ( type == QC_TYPE_TMP ) sprintf(pipe_name, "%s %s/%s | grep %s | grep surface", QC_GRIB, QC_MODEL_DIR, file_name, stype);
+	else					   sprintf(pipe_name, "%s %s/%s | grep %s", QC_GRIB, QC_MODEL_DIR, file_name, stype);
+	if ( (fp = popen(pipe_name, "r")) == NULL )
+	{
+		Log("_QC_GetMasterLine: Failed Pipe Open! pipe[%s] errno[%d]\n", pipe_name, errno);
+		return (-1);
+	}
+	
+	while ( 1 )
+	{
+		memset(buff, 0x00, MAX_BUFFER);
+		if ( fgets(buff, MAX_BUFFER, fp) == NULL ) break;
+		
+		get_next_token(buff, 0, token, ':');
+		master_line = atoi(token);
+	}
+	pclose(fp);
+	
+	return (master_line);
+}
+
+/* Get the value of the model data */
+int _QC_GetModelValue(char type, char* file_name, int master_line, int count, double* lngs, double* lats, double* values)
+{
+	FILE* fp;
+	char pipe_name[MAX_BUFFER], buff[MAX_BUFFER];
+	char *readbuf, databuf[MAX_BUFFER], token[64];
+	int i, j, len, ptr = 0, ptr2 = 0;
+	
+	/* Determine the name of the pipe */
+	sprintf(pipe_name, "%s %s/%s -d %d", QC_GRIB, QC_MODEL_DIR, file_name, master_line);
+	for ( i = 0 ; i < count ; i++ )
+	{
+		for ( j = 0 ; j < count ; j++ )
+		{
+			ptr = strlen(pipe_name);
+			sprintf(&pipe_name[ptr], " -lon %lf %lf", lngs[i], lats[j]);
+		}
+	}
+	
+	/* Pipe Open */
+	if ( (fp = popen(pipe_name, "r")) == NULL )
+	{
+		Log("_QC_GetMasterLine: Failed Pipe Open! pipe[%s] errno[%d]\n", pipe_name, errno);
+		return (-1);
+	}
+	
+	ptr = 0; readbuf = NULL;
+	while ( 1 )
+	{
+		memset(buff, 0x00, MAX_BUFFER);
+		if ( fgets(buff, MAX_BUFFER, fp) == NULL ) break;
+		
+		len = strlen(buff);
+		if ( buff[len-1] == '\n' ) len = len - 1;
+		readbuf = realloc(readbuf, ptr + len);
+		memcpy(readbuf+ptr, buff, len);
+		ptr = ptr + len;		
+	}
+	pclose(fp);
+	
+	/* Parse the data */
+	// ex) 107:143127890:lon=126.562500,lat=37.734375,val=102454:lon=126.562500,lat=37.968750,val=101518:lon=126.914063,lat=37.500000,val=101995
+	ptr = 0;
+	ptr = get_next_token(readbuf, ptr, databuf, ':');
+	ptr = get_next_token(readbuf, ptr, databuf, ':');
+	for ( i = 0 ; i < count ; i++ )
+	{
+		for ( j = 0 ; j < count ; j++ )
+		{
+			ptr = get_next_token(readbuf, ptr, databuf, ':');
+			if ( ptr <= 0 || strlen(databuf) < 2 ) break;
+			
+			ptr2 = 0;
+			while ( 1 )
+			{
+				ptr2 = get_next_token(databuf, ptr2, token, ',');
+				if ( ptr2 <= 0 || strlen(token) < 2 ) break;
+				
+				if ( strncmp(token, "lon=", 4) == 0 ) lngs[i] = atof(token+4);
+				if ( strncmp(token, "lat=", 4) == 0 ) lats[j] = atof(token+4);
+				if ( strncmp(token, "val=", 4) == 0 )
+				{
+					values[i*count+j] = atof(token+4);
+					
+					/* Adjust the value according to the classification value */
+					switch ( type )
+					{
+						case QC_TYPE_PRE: values[i*count+j] = values[i*count+j] / 100.0; break;
+						case QC_TYPE_TMP: values[i*count+j] = values[i*count+j] - 273.15; break;
+					}
+				}
+			}
+		}
+	}
+	free(readbuf);
+	
+	return (0);
+}
+
+/* Record the model data in the cache */
+int _QC_GetModelValueFromCache(char type, char* file_name, double lng, double lat, double* ptr_lng, double* ptr_lat, double* ptr_value, double* avg, double* stdev)
+{
+	FILE* fp;
+	char cache_file[256], buff[MAX_BUFFER];
+	
+	int i, j, count;
+	int mlng, mlat;
+	double v1, v2, v3;
+	
+	/* Determine the name of the cache file */
+	mlng = (int)(lng * 100.0); mlng = mlng - mlng % 5;
+	mlat = (int)(lat * 100.0); mlat = mlat - mlat % 5;
+	sprintf(cache_file, "%s/%c_%s_%d_%d", QC_MODEL_CACHE_DIR, type, file_name, mlng, mlat);
+	
+	/* open cache file */
+	if ( (fp = fopen(cache_file, "r")) == NULL )
+		return (0);
+	
+	while ( 1 )
+	{
+		memset(buff, 0x00, MAX_BUFFER);
+		if ( fgets(buff, MAX_BUFFER, fp) == NULL ) break;
+		
+		if ( strncmp(buff, "C:", 2) == 0 ) sscanf(buff+2, "%d", &count);
+		else if ( strncmp(buff, "S:", 2) == 0 ) sscanf(buff+2, "%lf,%lf", avg, stdev);
+		else
+		{
+			sscanf(buff+2, "%d,%d,%lf,%lf,%lf", &i, &j, &v1, &v2, &v3);
+			ptr_lng[i] = v1;
+			ptr_lat[j] = v2;
+			ptr_value[i*(count)+j] = v3;
+		}
+	}
+	
+	fclose(fp);
+	return (count);
+}
+
+/* Record the model data in the cache */
+void _QC_WriteModelValueToCache(char type, char* file_name, double lng, double lat, int count, double* ptr_lng, double* ptr_lat, double* ptr_value, double avg, double stdev)
+{
+	FILE* fp;
+	char cache_file[256];
+	
+	int i, j;
+	int mlng, mlat;
+	
+	/* Determine the name of the cache file */
+	mlng = (int)(lng * 100.0); mlng = mlng - mlng % 5;
+	mlat = (int)(lat * 100.0); mlat = mlat - mlat % 5;
+	sprintf(cache_file, "%s/%c_%s_%d_%d", QC_MODEL_CACHE_DIR, type, file_name, mlng, mlat);
+	
+	/* open cache file */
+	if ( (fp = fopen(cache_file, "w")) == NULL )
+		return;
+	
+	/* record cache */
+	fprintf(fp, "C:%d\n", count);
+	for ( i = 0 ; i < count ; i++ )
+	{
+		for ( j = 0 ; j < count ; j++ )
+		{
+			fprintf(fp, "D:%d,%d,%lf,%lf,%lf\n", i, j, ptr_lng[i], ptr_lat[j], ptr_value[i*(count)+j]);
+		}
+	}
+	fprintf(fp, "S:%lf,%lf\n", avg, stdev);
+	
+	/* close cache */
+	fclose(fp);
+}
+
+/* time difference */
+int _QC_SubtimeHour(int a, int b)
+{
+	struct tm tm;
+	time_t timea, timeb;
+	char stime[32];
+	
+	sprintf(stime, "%010d0000", a); strptime(stime, "%Y%m%d%H%M%S", &tm); timea = mktime(&tm);
+	sprintf(stime, "%010d0000", b); strptime(stime, "%Y%m%d%H%M%S", &tm); timeb = mktime(&tm);
+	
+	return ( (timea - timeb) / 3600 );
+}
+
+/* sum */
+double _QC_Sum(double data[], int count)
+{
+	int i;
+	double sum = 0.0;
+
+	for ( i = 0 ; i < count ; ++i )
+		sum += data[i];
+
+	return (sum);
+}
+
+/* mean */
+double _QC_Avg(double data[], int count)
+{
+	return ( _QC_Sum(data, count) / count );
+}
+
+/*  variance */
+double _QC_Var(double data[], int count)
+{
+	int i;
+	double sum = 0.0;
+	double avg = _QC_Avg(data, count);
+
+	for ( i = 0 ; i < count ; ++i )
+		sum += (data[i] - avg) * (data[i] - avg);
+
+	sum /= (double)(count - 1);
+
+	return sum;
+}
+
+/* the standard deviation */
+double _QC_Stdev(double data[], int count)
+{
+	return ( sqrt(_QC_Var(data, count)) );
+}
+
+/*************************************************************************************
+ * Relating to latitude
+ *************************************************************************************/
+
+double haversine_km(double lng1, double lat1, double lng2, double lat2)
+{
+	double dlng = _deg2rad(lng2 - lng1);
+	double dlat = _deg2rad(lat2 - lat1);
+	double a = pow(sin(dlat/2.0), 2) + cos(_deg2rad(lat1)) * cos(_deg2rad(lat2)) * pow(sin(dlng/2.0), 2);
+	double c = 2 * atan2(sqrt(a), sqrt(1-a));
+	double d = earth_radius(lat1) * c;
+
+	return d;
+}
+
+void latitude_range(double lat, double dkm, double* minlat, double* maxlat)
+{
+	double earth = earth_radius(lat);
+	double deg = 1 / ((2 * M_PI / 360) * earth);
+	
+	*minlat = lat - (dkm * deg);
+	*maxlat = lat + (dkm * deg);
+}
+
+void longitude_range(double lng, double lat, double dkm, double* minlng, double* maxlng)
+{
+	double earth = earth_radius(lat);
+	double deg1 = 1 / ((2 * M_PI / 360) * earth);
+	double deg2 = (dkm * deg1) / cos(_deg2rad(lat));
+
+	*minlng = lng - deg2;
+	*maxlng = lng + deg2;
+}
+
+double earth_radius(double lat)
+{
+	lat = _deg2rad(lat);
+	
+	double x = cos(lat) / 6378137.0;
+	double y = sin(lat) / (6378137.0 * (1 - (1 / 298.257223563)));
+
+	return (1 / (sqrt(x * x + y * y))) / 1000;
+}
+
+double _deg2rad(double deg)
+{
+	return (double)(deg * M_PI / 180.0);
+}
+
+double _rad2deg(double rad)
+{
+	return (double)(rad * 180.0 / M_PI);
+}
+
+/*************************************************************************************
+ * Regarding coordinate conversion
+ *************************************************************************************/
+
+int ConvertXYLonLat(int mode, float var1, float var2, float* ret1, float* ret2)
+{
+	float  lon, lat, x, y;
+	struct lamc_parameter map;
+
+	if ( mode == 1 )
+    {
+        x = var1;
+        y = var2;
+
+		if ( x < 1 || x > NX || y < 1 || y > NY )
+        {
+			printf("X-grid range [1,%d] / Y-grid range [1,%d]\n", NX, NY);
+			return (-1);
+        }
+    }
+	else if ( mode == 0 )
+    {
+		lon = var1;
+		lat = var2;
+    }
+    else
+    	return (-1);
+
+    //  Neighborhood forecast Map
+	map.Re    = 6371.00877;     // Radius of map
+	map.grid  = 5.0;            // Grid interval (km)
+    map.slat1 = 30.0;           // Standard Latitude 1
+    map.slat2 = 60.0;           // Standard Latitude 2
+	map.olon  = 126.0;          // Standard Longitude
+	map.olat  = 38.0;           // Standard Latitude
+	map.xo    = 210/map.grid;   // Standard X
+	map.yo    = 675/map.grid;   // Standard Y
+	map.first = 0;
+
+    //  Neighborhood forecast
+	map_conv(&lon, &lat, &x, &y, mode, map);
+
+	if ( mode == 1 )
+	{
+		*ret1 = lon;
+		*ret2 = lat;
+	}
+	else
+	{
+		*ret1 = x;
+		*ret2 = y;
+	}
+	
+	return (0);
+}
+
+/** Coordinate conversion
+ * 
+ *   lon                 (degree)
+ *   lat                 (degree) 
+ *   x                   (grid)
+ *   y                   (grid)
+ *   code                0 (grid -> LonLat), 1 (LonLat -> grig) 
+ *   lamc_parameter map  map information
+ */
+int map_conv(float* lon, float* lat, float* x, float* y, int code, struct lamc_parameter map)
+{
+	float  lon1, lat1, x1, y1;
+
+    //  LonLat -> (X,Y)
+	if (code == 0)
+    {
+        lon1 = *lon;
+        lat1 = *lat;
+		lamcproj(&lon1, &lat1, &x1, &y1, 0, &map);
+        *x = (int)(x1 + 1.5);
+        *y = (int)(y1 + 1.5);
+    }
+
+    //  (X,Y) -> LonLat
+	if (code == 1)
+    {
+		x1 = *x - 1;
+        y1 = *y - 1;
+		lamcproj(&lon1, &lat1, &x1, &y1, 1, &map);
+        *lon = lon1;
+        *lat = lat1;
+    }
+    
+	return (0);
+}
+
+/**
+ *
+ *  [ Lambert Conformal Conic Projection ]
+ *
+ *      lon, lat : (longitude,latitude) at earth  [degree]
+ *      x, y     : (x,y) cordinate in map  [grid]
+ *      code = 0 : (lon,lat) --> (x,y)
+ *               1 : (x,y) --> (lon,lat)
+ *
+ */
+
+int lamcproj(float* lon, float* lat, float* x, float* y, int code, struct lamc_parameter* map)
+{
+	static double  PI, DEGRAD, RADDEG;
+	static double  re, olon, olat, sn, sf, ro;
+	double         slat1, slat2, alon, alat, xn, yn, ra, theta;
+
+	if ( (*map).first == 0 )
+	{
+        PI = asin(1.0) * 2.0;
+        DEGRAD = PI / 180.0;
+        RADDEG = 180.0 / PI;
+
+		re = (*map).Re/(*map).grid;
+        slat1 = (*map).slat1 * DEGRAD;
+        slat2 = (*map).slat2 * DEGRAD;
+		olon = (*map).olon * DEGRAD;
+		olat = (*map).olat * DEGRAD;
+
+		sn = tan(PI * 0.25 + slat2 * 0.5) / tan(PI * 0.25 + slat1 * 0.5);
+		sn = log(cos(slat1) / cos(slat2)) / log(sn);
+		sf = tan(PI * 0.25 + slat1 * 0.5);
+		sf = pow(sf, sn) * cos(slat1) / sn;
+		ro = tan(PI * 0.25 + olat * 0.5);
+		ro = re * sf / pow(ro, sn);
+        (*map).first = 1;
+    }
+
+	if ( code == 0 )
+	{
+		ra = tan(PI * 0.25 + (*lat) * DEGRAD * 0.5);
+		ra = re * sf / pow(ra, sn);
+		theta = (*lon) * DEGRAD - olon;
+		if ( theta >  PI ) theta -= 2.0 * PI;
+		if ( theta < -PI ) theta += 2.0 * PI;
+		theta *= sn;
+        *x = (float)(ra * sin(theta)) + (*map).xo;
+        *y = (float)(ro - ra*cos(theta)) + (*map).yo;
+    }
+    else
+    {
+		xn = *x - (*map).xo;
+		yn = ro - *y + (*map).yo;
+		ra = sqrt(xn * xn + yn * yn);
+		if ( sn < 0.0 ) ra = (-1.0) * ra;
+		alat = pow((re * sf / ra), (1.0 / sn));
+		alat = 2.0 * atan(alat) - PI * 0.5;
+		if ( fabs(xn) <= 0.0 )
+		{
+			theta = 0.0;
+        }
+        else
+        {
+			if ( fabs(yn) <= 0.0 )
+			{
+				theta = PI * 0.5;
+				if ( xn < 0.0 ) theta = (-1.0) * theta;
+            }
+            else
+				theta = atan2(xn, yn);
+        }
+        
+		alon = theta / sn + olon;
+        *lat = (float)(alat * RADDEG);
+        *lon = (float)(alon * RADDEG);
+    }
+    
+	return (0);
+}
